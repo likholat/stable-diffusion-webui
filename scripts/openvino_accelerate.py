@@ -44,6 +44,7 @@ from diffusers import (
     StableDiffusionPipeline,
     StableDiffusionImg2ImgPipeline,
     StableDiffusionInpaintPipeline,
+    StableDiffusionLatentUpscalePipeline,
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
@@ -312,7 +313,30 @@ def set_scheduler(sd_model, sampler_name):
 
     return sd_model.scheduler
 
-def get_diffusers_sd_model(model_config, sampler_name, enable_caching, openvino_device, mode):
+def get_diffusers_upscaler(upscaler: str):
+    # curr_dir_path = os.getcwd()
+    # cash_dir = os.path.join(curr_dir_path, 'models','sd-x2-latent-upscaler')
+    # if not os.path.exists(cash_dir):
+    torch._dynamo.reset()
+    openvino_clear_caches()
+    model_name = "stabilityai/sd-x2-latent-upscaler"
+    print("OpenVINO Script: loading upscaling model: " + model_name) 
+    sd_model = StableDiffusionLatentUpscalePipeline.from_pretrained(model_name, torch_dtype=torch.float32)
+        # cash_dir = os.path.join(cash_dir, 'models--stabilityai--sd-x2-latent-upscaler')
+    # else:
+    #     cash_dir = os.path.join(cash_dir, 'models--stabilityai--sd-x2-latent-upscaler')
+    #     print("OpenVINO Script:  created model from config : " + cash_dir) 
+    #     sd_model = StableDiffusionLatentUpscalePipeline.from_pretrained(cash_dir, torch_dtype=torch.float32)
+    sd_model.safety_checker = None
+    sd_model.cond_stage_key = functools.partial(cond_stage_key, shared.sd_model)
+    sd_model.unet = torch.compile(sd_model.unet, backend="openvino_fx")
+    sd_model.vae.decode = torch.compile(sd_model.vae.decode, backend="openvino_fx")
+    shared.sd_diffusers_model = sd_model
+    del sd_model
+
+    return shared.sd_diffusers_model
+
+def get_diffusers_sd_model(model_config, sampler_name, mode):
     if (model_state.recompile == 1):
         torch._dynamo.reset()
         openvino_clear_caches()
@@ -440,7 +464,7 @@ def init_new(self, all_prompts, all_seeds, all_subseeds):
         raise RuntimeError(f"bad number of images passed: {len(imgs)}; expecting {self.batch_size} or less")
 
 
-def process_images_openvino(p: StableDiffusionProcessing, model_config, sampler_name, enable_caching, openvino_device, mode) -> Processed:
+def process_images_openvino(p: StableDiffusionProcessing, model_config, sampler_name, enable_caching, override_hires, upscaler, hires_steps, d_strength, openvino_device, mode) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
 
     if (mode == 0 and p.enable_hr):
@@ -520,8 +544,7 @@ def process_images_openvino(p: StableDiffusionProcessing, model_config, sampler_
                 model_state.mode = mode
                 model_state.model_hash = shared.sd_model.sd_model_hash
 
-            shared.sd_diffusers_model = get_diffusers_sd_model(model_config, sampler_name, enable_caching, openvino_device, mode)
-            shared.sd_diffusers_model.scheduler = set_scheduler(shared.sd_diffusers_model, sampler_name)
+            shared.sd_diffusers_model = get_diffusers_sd_model(model_config, sampler_name, mode)
 
             extra_network_data = p.parse_extra_network_prompts()
 
@@ -678,6 +701,22 @@ def process_images_openvino(p: StableDiffusionProcessing, model_config, sampler_
 
     devices.torch_gc()
 
+    # Hight resolutuon mode
+    if override_hires:
+        if upscaler == "Latent":
+            model_state.mode = 3
+            shared.sd_diffusers_model = get_diffusers_upscaler(upscaler)
+            output_images = shared.sd_diffusers_model(
+                        image=output_images,
+                        prompt=p.prompts,
+                        negative_prompt=p.negative_prompts,
+                        num_inference_steps=hires_steps,
+                        guidance_scale=p.cfg_scale,
+                        generator=generator,
+                        callback = callback,
+                        callback_steps = 1,
+            ).images
+
     res = Processed(
         p,
         images_list=output_images,
@@ -688,7 +727,8 @@ def process_images_openvino(p: StableDiffusionProcessing, model_config, sampler_
         index_of_first_image=index_of_first_image,
         infotexts=infotexts,
     )
-
+    if override_hires:
+        res.info = res.info + f", Hires upscaler: {upscaler}, Denoising strength: {d_strength}"
     res.info = res.info + ", Warm up time: " + str(round(warmup_duration, 2)) + " secs "
 
     if (generation_rate >= 1.0):
@@ -701,6 +741,9 @@ def process_images_openvino(p: StableDiffusionProcessing, model_config, sampler_
         p.scripts.postprocess(p, res)
 
     return res
+
+def on_change(mode):
+    return gr.update(visible=mode)
 
 class Script(scripts.Script):
     def title(self):
@@ -729,6 +772,12 @@ class Script(scripts.Script):
         override_sampler = gr.Checkbox(label="Override the sampling selection from the main UI (Recommended as only below sampling methods have been validated for OpenVINO)", value=True)
         sampler_name = gr.Radio(label="Select a sampling method", choices=["Euler a", "Euler", "LMS", "Heun", "DPM++ 2M", "LMS Karras", "DPM++ 2M Karras", "DDIM", "PLMS"], value="Euler a")
         enable_caching = gr.Checkbox(label="Cache the compiled models on disk for faster model load in subsequent launches (Recommended)", value=True, elem_id=self.elem_id("enable_caching"))
+        override_hires = gr.Checkbox(label="Override the Hires.fix selection from the main UI (Recommended as only below upscalers have been validated for OpenVINO)", value=False, visible=self.is_txt2img)
+        with gr.Group(visible=False) as hires:
+            with gr.Row():
+                upscaler = gr.Dropdown(label="Upscaler", choices=["Latent"], value="Latent")
+                hires_steps = gr.Slider(1, 150, value=10, step=1, label="Steps")
+                d_strength = gr.Slider(0, 1, value=0.5, step=0.01, label="Strength")
         warmup_status = gr.Textbox(label="Device", interactive=False, visible=False)
         gr.Markdown(
         """
@@ -742,6 +791,8 @@ class Script(scripts.Script):
         So it's normal for the first inference after a settings change to be slower, while subsequent inferences use the optimized compiled model and run faster.
         """)
 
+        override_hires.change(on_change, override_hires, hires)
+
         def device_change(choice):
             if (model_state.device == choice):
                 return gr.update(value="Device selected is " + choice, visible=True)
@@ -751,9 +802,9 @@ class Script(scripts.Script):
                 return gr.update(value="Device changed to " + choice + ". Model will be re-compiled", visible=True)
         openvino_device.change(device_change, openvino_device, warmup_status)
 
-        return [model_config, openvino_device, override_sampler, sampler_name, enable_caching]
+        return [model_config, openvino_device, override_sampler, sampler_name, enable_caching, override_hires, upscaler, hires_steps, d_strength]
 
-    def run(self, p, model_config, openvino_device, override_sampler, sampler_name, enable_caching):
+    def run(self, p, model_config, openvino_device, override_sampler, sampler_name, enable_caching, override_hires, upscaler, hires_steps, d_strength):
         model_state.partition_id = 0
         os.environ["OPENVINO_TORCH_BACKEND_DEVICE"] = str(openvino_device)
 
@@ -771,14 +822,14 @@ class Script(scripts.Script):
         mode = 0
         if self.is_txt2img:
             mode = 0
-            processed = process_images_openvino(p, model_config, p.sampler_name, enable_caching, openvino_device, mode)
+            processed = process_images_openvino(p, model_config, p.sampler_name, enable_caching, override_hires, upscaler, hires_steps, d_strength, openvino_device, mode)
         else:
             if p.image_mask is None:
                 mode = 1
             else:
                 mode = 2
             p.init = functools.partial(init_new, p)
-            processed = process_images_openvino(p, model_config, p.sampler_name, enable_caching, openvino_device, mode)
+            processed = process_images_openvino(p, model_config, p.sampler_name, enable_caching, override_hires, upscaler, hires_steps, d_strength, openvino_device, mode)
         return processed
 
 
